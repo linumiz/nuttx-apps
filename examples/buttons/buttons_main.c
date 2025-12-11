@@ -26,15 +26,15 @@
 
 #include <nuttx/config.h>
 
-#include <sys/ioctl.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <sched.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
-#include <poll.h>
-#include <fcntl.h>
-#include <sched.h>
-#include <errno.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
 
 #include <nuttx/input/buttons.h>
@@ -140,6 +140,51 @@ static bool g_button_daemon_started;
  ****************************************************************************/
 
 /****************************************************************************
+ * Name: process_sample
+ *
+ * Description:
+ *   Process button sample and detect press/release transitions.
+ *
+ * Input Parameters:
+ *   sample    - Current button state bitmask
+ *   oldsample - Previous button state bitmask
+ *
+ ****************************************************************************/
+
+static void process_sample(btn_buttonset_t sample,
+                           btn_buttonset_t *oldsample)
+{
+#ifdef CONFIG_EXAMPLES_BUTTONS_NAMES
+  int i;
+
+  /* Iterate through the configured number of buttons */
+
+  for (i = 0; i < CONFIG_EXAMPLES_BUTTONS_QTD; i++)
+    {
+      if ((sample & (1 << i)) && !((*oldsample) & (1 << i)))
+        {
+          printf("%s was pressed\n", button_name[i]);
+        }
+
+      if (!(sample & (1 << i)) && ((*oldsample) & (1 << i)))
+        {
+          printf("%s was released\n", button_name[i]);
+        }
+    }
+#else
+
+  if (sample != *oldsample)
+    {
+      printf("Sample = %jd\n", (intmax_t)sample);
+    }
+
+#endif
+  fflush(stdout);
+  usleep(1000);
+  *oldsample = sample;
+}
+
+/****************************************************************************
  * Name: button_daemon
  ****************************************************************************/
 
@@ -156,9 +201,7 @@ static int button_daemon(int argc, char *argv[])
   btn_buttonset_t supported;
   btn_buttonset_t sample = 0;
 
-#ifdef CONFIG_EXAMPLES_BUTTONS_NAMES
   btn_buttonset_t oldsample = 0;
-#endif
 
   int ret;
   int fd;
@@ -201,11 +244,11 @@ static int button_daemon(int argc, char *argv[])
 #ifdef CONFIG_EXAMPLES_BUTTONS_SIGNAL
   /* Define the notifications events */
 
-  btnevents.bn_press   = supported;
+  btnevents.bn_press = supported;
   btnevents.bn_release = supported;
 
   btnevents.bn_event.sigev_notify = SIGEV_SIGNAL;
-  btnevents.bn_event.sigev_signo  = CONFIG_EXAMPLES_BUTTONS_SIGNO;
+  btnevents.bn_event.sigev_signo = CONFIG_EXAMPLES_BUTTONS_SIGNO;
 
   /* Register to receive a signal when buttons are pressed/released */
 
@@ -222,6 +265,7 @@ static int button_daemon(int argc, char *argv[])
   /* Ignore the default signal action */
 
   signal(CONFIG_EXAMPLES_BUTTONS_SIGNO, SIG_IGN);
+
 #endif
 
   /* Now loop forever, waiting BUTTONs events */
@@ -232,12 +276,9 @@ static int button_daemon(int argc, char *argv[])
       struct siginfo value;
       sigset_t set;
 #endif
-
 #ifdef CONFIG_EXAMPLES_BUTTONS_POLL
-      bool timeout;
       int nbytes;
 #endif
-
 #ifdef CONFIG_EXAMPLES_BUTTONS_SIGNAL
       /* Wait for a signal */
 
@@ -253,8 +294,9 @@ static int button_daemon(int argc, char *argv[])
         }
 
       sample = (btn_buttonset_t)value.si_value.sival_int;
-#endif
+      process_sample(sample, &oldsample);
 
+#endif
 #ifdef CONFIG_EXAMPLES_BUTTONS_POLL
       /* Prepare the File Descriptor for poll */
 
@@ -263,8 +305,6 @@ static int button_daemon(int argc, char *argv[])
       fds[0].fd      = fd;
       fds[0].events  = POLLIN;
 
-      timeout        = false;
-
       ret = poll(fds, 1, CONFIG_INPUT_BUTTONS_POLL_DELAY);
 
       printf("\nbutton_daemon: poll returned: %d\n", ret);
@@ -272,15 +312,30 @@ static int button_daemon(int argc, char *argv[])
         {
           int errcode = errno;
           printf("button_daemon: ERROR poll failed: %d\n", errcode);
+          continue;
         }
       else if (ret == 0)
         {
           printf("button_daemon: Timeout\n");
-          timeout = true;
+          continue;
         }
       else if (ret > CONFIG_INPUT_BUTTONS_NPOLLWAITERS)
         {
           printf("button_daemon: ERROR poll reported: %d\n", errno);
+        }
+
+      if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL))
+        {
+          printf("button_daemon: poll() error revents=0x%lx\n",
+                 fds[0].revents);
+          goto errout_with_fd;
+        }
+
+      if (!(fds[0].revents & POLLIN))
+        {
+          /* Spurious wakeup? */
+
+          continue;
         }
 
       /* In any event, read until the pipe is empty */
@@ -289,68 +344,27 @@ static int button_daemon(int argc, char *argv[])
         {
           nbytes = read(fds[0].fd, (void *)&sample, sizeof(btn_buttonset_t));
 
-          if (nbytes <= 0)
+          if (nbytes < 0)
             {
-              if (nbytes == 0 || errno == EAGAIN)
+              if (errno == EAGAIN || errno == EINTR)
                 {
-                  if ((fds[0].revents & POLLIN) != 0)
-                    {
-                      printf("button_daemon: ERROR no read data\n");
-                    }
-                }
-              else if (errno != EINTR)
-                {
-                  printf("button_daemon: read failed: %d\n", errno);
+                  break;
                 }
 
-              nbytes = 0;
+              printf("button_daemon: read failed: %d\n", errno);
+              goto errout_with_fd;
             }
-          else
+          else if (nbytes == 0)
             {
-              if (timeout)
-                {
-                  printf("button_daemon: ERROR? Poll timeout, "
-                         "but data read\n");
-                  printf("               (might just be a race "
-                         "condition)\n");
-                }
+              printf("button_daemon: No data read\n");
+              break;
             }
 
-          /* Suppress error report if no read data on the next time
-           * through
-           */
-
-          fds[0].revents = 0;
+          process_sample(sample, &oldsample);
         }
-      while (nbytes > 0);
+      while (1);
+
 #endif
-
-#ifdef CONFIG_EXAMPLES_BUTTONS_NAMES
-      /* Print name of all pressed/release button */
-
-      for (i = 0; i < CONFIG_EXAMPLES_BUTTONS_QTD; i++)
-        {
-          if ((sample & (1 << i)) && !(oldsample & (1 << i)))
-            {
-              printf("%s was pressed\n", button_name[i]);
-            }
-
-          if (!(sample & (1 << i)) && (oldsample & (1 << i)))
-            {
-              printf("%s was released\n", button_name[i]);
-            }
-        }
-
-      oldsample = sample;
-#else
-      printf("Sample = %jd\n", (intmax_t)sample);
-#endif
-
-      /* Make sure that everything is displayed */
-
-      fflush(stdout);
-
-      usleep(1000);
     }
 
 errout_with_fd:
@@ -358,7 +372,6 @@ errout_with_fd:
 
 errout:
   g_button_daemon_started = false;
-
   printf("button_daemon: Terminating\n");
   return EXIT_FAILURE;
 }
@@ -385,6 +398,7 @@ int main(int argc, FAR char *argv[])
   ret = task_create("button_daemon", CONFIG_EXAMPLES_BUTTONS_PRIORITY,
                     CONFIG_EXAMPLES_BUTTONS_STACKSIZE, button_daemon,
                     NULL);
+
   if (ret < 0)
     {
       int errcode = errno;
